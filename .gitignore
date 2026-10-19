@@ -1,0 +1,23 @@
+# Local Python environments
+psychopy_env/
+.venv/
+venv/
+
+# Participant and timing data
+**/data/
+
+# Python-generated files
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# macOS and temporary files
+.DS_Store
+Icon?
+.tmp.*
+
+# Logs
+*.log
