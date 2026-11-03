@@ -236,12 +236,35 @@ def ensure_bids_dataset_root(participant: str, counterbalance_group: int) -> Non
         writer.writerows(rows)
 
 
-def run_smoke_test() -> int:
+def configure_audio_output(device_name: Optional[str] = None) -> Optional[str]:
+    """Use the Windows default output instead of PsychoPy's first device."""
+    from psychopy import prefs
+    from psychopy.hardware.speaker import SpeakerDevice
+
+    if device_name is None and sys.platform == "win32":
+        import sounddevice
+        device_name = sounddevice.query_devices(kind="output")["name"]
+    if device_name is not None:
+        available = {item["deviceName"] for item in SpeakerDevice.getAvailableDevices()}
+        if device_name not in available:
+            raise RuntimeError(
+                f"Audio output {device_name!r} is unavailable to PsychoPy. "
+                f"Available outputs: {sorted(available)}"
+            )
+        # Set only this process's preference; do not change Windows or user settings.
+        prefs.hardware["audioDevice"] = [device_name]
+        print(f"EOEC audio output: {device_name}", flush=True)
+    return device_name
+
+
+def run_smoke_test(audio_device: Optional[str] = None) -> int:
     """Open a brief window and play the two tones."""
     try:
         from psychopy import core, sound, visual
     except ImportError as exc:
         raise RuntimeError("PsychoPy is required for the smoke test") from exc
+
+    configure_audio_output(audio_device)
 
     win = visual.Window(
         size=(800, 600),
@@ -297,6 +320,8 @@ def run_experiment(args: argparse.Namespace) -> int:
             "PsychoPy is required. Use ../psychopy_env/bin/python or install "
             "PsychoPy in the active environment."
         ) from exc
+
+    audio_output_device = configure_audio_output(args.audio_device)
 
     dialog_values = {
         "Participant ID": args.participant,
@@ -363,7 +388,8 @@ def run_experiment(args: argparse.Namespace) -> int:
     screen_size = (args.screen_width_px, args.screen_height_px)
     win = visual.Window(
         size=window_size,
-        fullscr=False,
+        fullscr=not args.windowed,
+        screen=args.screen_index,
         units="pix",
         color=BACKGROUND_RGB255,
         colorSpace="rgb255",
@@ -372,12 +398,23 @@ def run_experiment(args: argparse.Namespace) -> int:
         allowGUI=True,
         useRetina=True,
     )
+    # Fullscreen uses the selected desktop's actual drawable dimensions.
+    # This pixel count is not a measurement of the virtual screen's visual angle.
+    requested_window_size = window_size
+    window_size = tuple(int(value) for value in win.size)
+    framebuffer_size = tuple(int(value) for value in win.frameBufferSize)
+    if not args.windowed:
+        screen_size = window_size
+    print(f"Display: fullscreen={not args.windowed}, screen={args.screen_index}, drawable={window_size}, framebuffer={framebuffer_size}", flush=True)
+
     win.mouseVisible = True
     logging.console.setLevel(logging.WARNING)
 
     class TriggerPort:
         def __init__(self) -> None:
             self.port = None
+            self.lsl = None
+            self.galea_udp = None
             self.mode = "none"
             if args.send_parallel_triggers:
                 from psychopy import parallel
@@ -387,9 +424,25 @@ def run_experiment(args: argparse.Namespace) -> int:
                 self.port.setData(0)
                 self.mode = f"parallel:{hex(address)}"
 
+            if args.send_lsl_markers:
+                sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+                from galea_pilot_markers import LslMarkers
+                self.lsl = LslMarkers('eoec', args.lsl_stream_name)
+                self.mode = (self.mode + "+" if self.mode != "none" else "") + "lsl:" + args.lsl_stream_name
+
+            if args.send_galea_markers:
+                sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+                from galea_pilot_markers import GaleaUdpMarkers
+                self.galea_udp = GaleaUdpMarkers(args.galea_marker_port)
+                self.mode = (self.mode + "+" if self.mode != "none" else "") + "galea-udp:" + str(args.galea_marker_port)
+
         def send(self, code: int) -> None:
             if self.port is not None:
                 self.port.setData(int(code))
+            if self.galea_udp is not None:
+                self.galea_udp.send(code)
+            if self.lsl is not None:
+                self.lsl.send(code)
 
         def reset(self) -> None:
             if self.port is not None:
@@ -397,6 +450,10 @@ def run_experiment(args: argparse.Namespace) -> int:
 
         def close(self) -> None:
             self.reset()
+            if self.lsl is not None:
+                self.lsl.close()
+            if self.galea_udp is not None:
+                self.galea_udp.close()
 
     trigger = TriggerPort()
 
@@ -779,11 +836,15 @@ def run_experiment(args: argparse.Namespace) -> int:
         "elapsed_s": elapsed_s,
         "expected_refresh_hz": EXPECTED_REFRESH_HZ,
         "refresh_rate_measured": False,
+        "audio_output_device": audio_output_device,
         "trigger_mode": trigger.mode,
         "display": {
             "screen_size_px": list(screen_size),
             "window_size_px": list(window_size),
-            "fullscreen": False,
+            "fullscreen": not args.windowed,
+            "screen_index": args.screen_index,
+            "framebuffer_size_px": list(framebuffer_size),
+            "requested_window_size_px": list(requested_window_size),
             "background_rgb255": list(BACKGROUND_RGB255),
             "fixation_present": False,
         },
@@ -868,6 +929,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="briefly open a PsychoPy window and play both tones",
     )
+    parser.add_argument("--audio-device", default=None,
+                        help="audio output name; Windows uses the current system default")
+    display_mode = parser.add_mutually_exclusive_group()
+    display_mode.add_argument("--fullscreen", dest="windowed", action="store_false",
+                              help="fill the selected desktop display (default)")
+    display_mode.add_argument("--windowed", action="store_true",
+                              help="use the requested window dimensions for debugging")
+    parser.set_defaults(windowed=False)
+    parser.add_argument("--screen-index", type=int, default=0,
+                        help="PsychoPy display index for task presentation (default 0)")
     parser.add_argument("--participant", default="debug", help="participant identifier")
     parser.add_argument("--run", default="01", help="numeric BIDS run label")
     parser.add_argument(
@@ -889,6 +960,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--screen-height-px",
         type=int,
         default=DEFAULT_SCREEN_SIZE_PX[1],
+    )
+    parser.add_argument(
+        "--send-galea-markers", action="store_true",
+        help="main task: send network-order float64 UDP markers to the local Galea GUI",
+    )
+    parser.add_argument(
+        "--galea-marker-port", type=int, default=12340,
+        help="must match the Galea GUI Marker widget UDP receive port (default 12340)",
+    )
+    parser.add_argument(
+        "--send-lsl-markers", action="store_true",
+        help="main task: publish original event codes as an LSL Markers stream",
+    )
+    parser.add_argument(
+        "--lsl-stream-name", default="GaleaPsychoPyMarkers",
+        help="LSL marker stream name; select it alongside Galea EEG in LabRecorder",
     )
     parser.add_argument(
         "--send-parallel-triggers",
@@ -914,7 +1001,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(validate_design(participant), indent=2))
         return 0
     if args.smoke_test:
-        return run_smoke_test()
+        return run_smoke_test(args.audio_device)
     return run_experiment(args)
 
 
