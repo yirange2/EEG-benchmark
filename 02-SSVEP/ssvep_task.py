@@ -534,7 +534,8 @@ def run_experiment(args: argparse.Namespace, program_phase: str) -> int:
 
     win = visual.Window(
         size=window_size,
-        fullscr=False,
+        fullscr=not args.windowed,
+        screen=args.screen_index,
         monitor=monitor,
         units="deg",
         color=BACKGROUND_RGB255,
@@ -544,12 +545,24 @@ def run_experiment(args: argparse.Namespace, program_phase: str) -> int:
         allowGUI=True,
         useRetina=True,
     )
+    # Fullscreen uses the selected desktop's actual drawable dimensions.
+    # This pixel count is not a measurement of the virtual screen's visual angle.
+    requested_window_size = window_size
+    window_size = tuple(int(value) for value in win.size)
+    framebuffer_size = tuple(int(value) for value in win.frameBufferSize)
+    if not args.windowed:
+        screen_size = window_size
+        monitor.setSizePix(screen_size)
+    print(f"Display: fullscreen={not args.windowed}, screen={args.screen_index}, drawable={window_size}, framebuffer={framebuffer_size}", flush=True)
+
     win.mouseVisible = True
     logging.console.setLevel(logging.WARNING)
 
     class TriggerPort:
         def __init__(self) -> None:
             self.port = None
+            self.lsl = None
+            self.galea_udp = None
             self.mode = "none"
             # Practice never sends triggers, even if the command-line flag is
             # accidentally supplied.
@@ -561,9 +574,25 @@ def run_experiment(args: argparse.Namespace, program_phase: str) -> int:
                 self.port.setData(0)
                 self.mode = f"parallel:{hex(address)}"
 
+            if program_phase == "main" and args.send_lsl_markers:
+                sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+                from galea_pilot_markers import LslMarkers
+                self.lsl = LslMarkers('ssvep', args.lsl_stream_name)
+                self.mode = (self.mode + "+" if self.mode != "none" else "") + "lsl:" + args.lsl_stream_name
+
+            if program_phase == "main" and args.send_galea_markers:
+                sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+                from galea_pilot_markers import GaleaUdpMarkers
+                self.galea_udp = GaleaUdpMarkers(args.galea_marker_port)
+                self.mode = (self.mode + "+" if self.mode != "none" else "") + "galea-udp:" + str(args.galea_marker_port)
+
         def send(self, code: int) -> None:
             if self.port is not None:
                 self.port.setData(int(code))
+            if self.galea_udp is not None:
+                self.galea_udp.send(code)
+            if self.lsl is not None:
+                self.lsl.send(code)
 
         def reset(self) -> None:
             if self.port is not None:
@@ -571,6 +600,10 @@ def run_experiment(args: argparse.Namespace, program_phase: str) -> int:
 
         def close(self) -> None:
             self.reset()
+            if self.lsl is not None:
+                self.lsl.close()
+            if self.galea_udp is not None:
+                self.galea_udp.close()
 
     trigger = TriggerPort()
 
@@ -1124,7 +1157,10 @@ def run_experiment(args: argparse.Namespace, program_phase: str) -> int:
         "display": {
             "screen_size_px": list(screen_size),
             "window_size_px": list(window_size),
-            "fullscreen": False,
+            "fullscreen": not args.windowed,
+            "screen_index": args.screen_index,
+            "framebuffer_size_px": list(framebuffer_size),
+            "requested_window_size_px": list(requested_window_size),
             "display_width_cm": args.display_width_cm,
             "display_height_cm": args.display_height_cm,
             "viewing_distance_cm": args.viewing_distance_cm,
@@ -1235,6 +1271,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="briefly draw the stimuli in a PsychoPy window",
     )
+    display_mode = parser.add_mutually_exclusive_group()
+    display_mode.add_argument("--fullscreen", dest="windowed", action="store_false",
+                              help="fill the selected desktop display (default)")
+    display_mode.add_argument("--windowed", action="store_true",
+                              help="use the requested window dimensions for debugging")
+    parser.set_defaults(windowed=False)
+    parser.add_argument("--screen-index", type=int, default=0,
+                        help="PsychoPy display index for task presentation (default 0)")
     parser.add_argument("--participant", default="debug", help="participant identifier")
     parser.add_argument(
         "--run",
@@ -1276,6 +1320,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--viewing-distance-cm",
         type=float,
         default=VIEWING_DISTANCE_CM,
+    )
+    parser.add_argument(
+        "--send-galea-markers", action="store_true",
+        help="main task: send network-order float64 UDP markers to the local Galea GUI",
+    )
+    parser.add_argument(
+        "--galea-marker-port", type=int, default=12340,
+        help="must match the Galea GUI Marker widget UDP receive port (default 12340)",
+    )
+    parser.add_argument(
+        "--send-lsl-markers", action="store_true",
+        help="main task: publish original event codes as an LSL Markers stream",
+    )
+    parser.add_argument(
+        "--lsl-stream-name", default="GaleaPsychoPyMarkers",
+        help="LSL marker stream name; select it alongside Galea EEG in LabRecorder",
     )
     parser.add_argument(
         "--send-parallel-triggers",
